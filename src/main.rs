@@ -1,246 +1,139 @@
 use eframe::{egui, App, Frame, NativeOptions};
 use serde::{Deserialize, Serialize};
-use std::fs::File;
-use std::io::BufReader;
-use std::process::{Command, Stdio};
-use tracing::{error, info};
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+use std::sync::{Arc, Mutex};
+use tokio::runtime::Runtime;
+use tracing::{debug, error, info, instrument};
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use anyhow::{Result, anyhow};
 
-#[tokio::main]
-async fn main() -> Result<(), eframe::Error> {
+
+fn main() -> Result<()> {
     tracing_subscriber::registry()
-        .with(tracing_subscriber::EnvFilter::new(std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into())))
+        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    let options = NativeOptions {
-        initial_window_size: Some(egui::vec2(800.0, 600.0)),
-        ..Default::default()
-    };
-
+    let native_options = NativeOptions::default();
     eframe::run_native(
         "CodeFlow",
-        options,
-        Box::new(|cc| {
-            // This gives us context to create things like fonts!
-            egui_extras::install_image_loaders(&cc.egui_ctx);
-            Box::new(CodeFlowApp::new(cc))
-        }),
-    )
+        native_options,
+        Box::new(|cc| Box::new(CodeFlowApp::new(cc))), 
+    )?; // Removed the ? from here
+
+    Ok(())
 }
 
-#[derive(Deserialize, Serialize, Debug, Clone)]
-struct CodeBlock {
-    id: String,
+
+#[derive(Serialize, Deserialize, Default)]
+struct CodeFlowState {
     code: String,
-    language: String,
-    x: f32,
-    y: f32,
+    output: String,
 }
 
-#[derive(Deserialize, Serialize, Debug, Clone)]
-struct CodeFlowData {
-    code_blocks: Vec<CodeBlock>,
-}
-
-impl Default for CodeFlowData {
-    fn default() -> Self {
-        CodeFlowData {
-            code_blocks: vec![],
-        }
-    }
+#[derive(Default, Clone)]
+pub struct ExecutionResult {
+    pub stdout: String,
+    pub stderr: String,
+    pub duration: std::time::Duration,
 }
 
 struct CodeFlowApp {
-    data: CodeFlowData,
-    selected_block_id: Option<String>,
-    new_block_code: String,
-    run_output: String,
+    state: CodeFlowState,
+    execution_result: Arc<Mutex<Option<ExecutionResult>>>, // Use Arc<Mutex<Option>>
+    rt: Arc<Runtime>,
 }
 
 impl CodeFlowApp {
     fn new(_cc: &eframe::CreationContext<'_>) -> Self {
-        // Load previous app state (if any).
-        // Note that you must enable the `persistence` feature for this to work.
-        // if let Some(storage) = cc.storage {
-        //     return eframe::get_value(storage, eframe::APP_KEY).unwrap_or_default();
-        // }
-
-        let data = match load_data_from_file("codeflow.json") {
-            Ok(d) => d,
-            Err(e) => {
-                error!("Failed to load data: {}", e);
-                CodeFlowData::default()
-            }
-        };
-
-        CodeFlowApp {
-            data,
-            selected_block_id: None,
-            new_block_code: String::new(),
-            run_output: String::new(),
+        Self {
+            state: CodeFlowState::default(),
+            execution_result: Arc::new(Mutex::new(None)),
+            rt: Arc::new(Runtime::new().unwrap()),
         }
+    }
+
+    #[instrument(skip(self), fields(code_length = self.state.code.len()))]
+    fn execute_code(&self) -> Result<()> {
+        let code = self.state.code.clone();
+        let execution_result_clone = self.execution_result.clone(); // Clone the Arc
+
+        self.rt.spawn(async move {
+            info!("Executing code...");
+            let start_time = std::time::Instant::now();
+            let result = execute_code_async(&code).await;
+            let duration = start_time.elapsed();
+
+            let mut execution_result = execution_result_clone.lock().unwrap();
+            match result {
+                Ok(stdout) => {
+                    info!("Code executed successfully");
+                    *execution_result = Some(ExecutionResult {
+                        stdout,
+                        stderr: String::new(),
+                        duration,
+                    });
+                }
+                Err(e) => {
+                    error!("Code execution failed: {}", e);
+                    *execution_result = Some(ExecutionResult {
+                        stdout: String::new(),
+                        stderr: format!("{}", e),
+                        duration,
+                    });
+                }
+            }
+        });
+        Ok(())
+    }
+}
+
+#[async_instrument]
+async fn execute_code_async(code: &str) -> Result<String> {
+    // Placeholder for actual code execution.  Replace with a proper sandboxed execution environment
+    debug!("Running code: {}", code);
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await; // Simulate some work
+
+    if code.contains("error") {
+        Err(anyhow::anyhow!("Simulated runtime error"))
+    } else {
+        Ok(format!("Code executed successfully.  Input code length: {}", code.len()))
     }
 }
 
 impl App for CodeFlowApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut Frame) {
         egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                if ui.button("Add Block").clicked() {
-                    let id = uuid::Uuid::new_v4().to_string();
-                    self.data.code_blocks.push(CodeBlock {
-                        id: id.clone(),
-                        code: String::new(),
-                        language: "python".to_string(),
-                        x: 50.0,
-                        y: 50.0,
-                    });
-                    self.selected_block_id = Some(id);
-                }
-
-                if ui.button("Load").clicked() {
-                    match load_data_from_file("codeflow.json") {
-                        Ok(data) => {
-                            self.data = data;
-                            self.selected_block_id = None;
-                        }
-                        Err(e) => error!("Failed to load data: {}", e),
-                    }
-                }
-
-                if ui.button("Save").clicked() {
-                    if let Err(e) = save_data_to_file("codeflow.json", &self.data) {
-                        error!("Failed to save data: {}", e);
-                    }
-                }
-
-                if ui.button("Run").clicked() {
-                    if let Some(block_id) = &self.selected_block_id {
-                        if let Some(block) = self.data.code_blocks.iter().find(|b| &b.id == block_id) {
-                            match run_code(&block.code, &block.language) {
-                                Ok(output) => {
-                                    self.run_output = output;
-                                }
-                                Err(e) => {
-                                    self.run_output = format!("Error: {}", e);
-                                    error!("Failed to run code: {}", e);
-                                }
-                            }
-                        } else {
-                            self.run_output = "Error: Selected block not found.".to_string();
-                        }
-                    } else {
-                        self.run_output = "Error: No block selected.".to_string();
-                    }
-                }
-
-                ui.label(format!("Run Output: {}", self.run_output));
-            });
+            ui.heading("CodeFlow");
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            for block in &mut self.data.code_blocks {
-                let id = block.id.clone();
-                let title = format!("Code Block {}", id);
-                let mut frame = egui::Frame::group(&ctx.style());
-
-                if Some(id.clone()) == self.selected_block_id {
-                    frame = frame.stroke(egui::Stroke::new(2.0, egui::Color32::YELLOW));
+            ui.horizontal(|ui| {
+                ui.label("Code:");
+                if ui.button("Run").clicked() {
+                    if let Err(e) = self.execute_code() {
+                        error!("Failed to start code execution: {}", e);
+                    }
                 }
+            });
 
-                frame.show(ui, |ui| {
-                    ui.set_width(200.0);
-                    ui.set_height(150.0);
-                    ui.heading(title);
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                ui.add(egui::TextEdit::multiline(&mut self.state.code).code_editor());
+            });
 
-                    let res = ui.add(egui::TextEdit::multiline(&mut block.code).desired_rows(4).code_editor());
-                    if res.gained_focus() {
-                        self.selected_block_id = Some(id.clone());
-                    }
-                    if res.clicked() {
-                        self.selected_block_id = Some(id.clone());
-                    }
+            ui.separator();
 
-                    ui.horizontal(|ui| {
-                        ui.label("Language:");
-                        egui::ComboBox::from_label("Language")
-                            .selected_text(block.language.clone())
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut block.language, "python".to_string(), "Python");
-                                ui.selectable_value(&mut block.language, "rust".to_string(), "Rust");
-                            });
-                    });
-
-                });
+            ui.label("Output:");
+            let mut output_text = String::new();
+            if let Ok(execution_result_guard) = self.execution_result.lock() {
+                if let Some(execution_result) = execution_result_guard.as_ref() {
+                    output_text.push_str(&format!("Stdout: {}\n", execution_result.stdout));
+                    output_text.push_str(&format!("Stderr: {}\n", execution_result.stderr));
+                    output_text.push_str(&format!("Duration: {:?}\n", execution_result.duration));
+                } else {
+                    output_text.push_str("Executing...");
+                }
             }
+            ui.add(egui::TextEdit::multiline(&mut output_text).read_only());
         });
-    }
-}
-
-fn load_data_from_file(path: &str) -> Result<CodeFlowData> {
-    let file = File::open(path).map_err(|e| anyhow!("Failed to open file: {}", e))?;
-    let reader = BufReader::new(file);
-    let data = serde_json::from_reader(reader).map_err(|e| anyhow!("Failed to deserialize data: {}", e))?;
-    Ok(data)
-}
-
-fn save_data_to_file(path: &str, data: &CodeFlowData) -> Result<()> {
-    let file = File::create(path).map_err(|e| anyhow!("Failed to create file: {}", e))?;
-    serde_json::to_writer_pretty(file, data).map_err(|e| anyhow!("Failed to serialize data: {}", e))?
-    Ok(())
-}
-
-fn run_code(code: &str, language: &str) -> Result<String> {
-    info!("Running code with language: {}", language);
-    match language {
-        "python" => {
-            let mut cmd = Command::new("python3");
-            cmd.arg("-c");
-            cmd.arg(code);
-            cmd.stdout(Stdio::piped());
-            cmd.stderr(Stdio::piped());
-
-            let mut child = cmd.spawn().map_err(|e| anyhow!("Failed to spawn process: {}", e))?;
-            let output = child.wait_with_output().map_err(|e| anyhow!("Failed to wait for process: {}", e))?;
-
-            if output.status.success() {
-                String::from_utf8(output.stdout).map_err(|e| anyhow!("Failed to convert stdout to string: {}", e))
-            } else {
-                String::from_utf8(output.stderr).map_err(|e| anyhow!("Failed to convert stderr to string: {}", e))
-            }
-        }
-        "rust" => {
-            // Create a temporary file
-            let temp_file_path = "temp_code.rs";
-            std::fs::write(temp_file_path, code).map_err(|e| anyhow!("Failed to write to temp file: {}", e))?;
-
-            let mut cmd = Command::new("rustc");
-            cmd.arg(temp_file_path);
-            cmd.arg("-o");
-            cmd.arg("temp_code");
-            
-            let output = cmd.output().map_err(|e| anyhow!("Failed to compile code: {}", e))?;
-
-            if !output.status.success() {
-                let err_msg = String::from_utf8(output.stderr).map_err(|e| anyhow!("Failed to decode compiler error: {}", e))?;
-                return Err(anyhow!("Compilation failed: {}", err_msg));
-            }
-
-            let mut cmd = Command::new("./temp_code");
-            let output = cmd.output().map_err(|e| anyhow!("Failed to run compiled code: {}", e))?;
-
-            // Clean up the temporary executable (optional)
-            std::fs::remove_file("temp_code").ok();  // Ignore result, cleanup is best effort
-            std::fs::remove_file(temp_file_path).ok();
-
-            if output.status.success() {
-                String::from_utf8(output.stdout).map_err(|e| anyhow!("Failed to decode output: {}", e))
-            } else {
-                String::from_utf8(output.stderr).map_err(|e| anyhow!("Failed to decode stderr: {}", e))
-            }
-        }
-        _ => Err(anyhow!("Unsupported language: {}", language)),
     }
 }
